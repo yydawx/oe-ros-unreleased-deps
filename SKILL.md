@@ -35,6 +35,10 @@ For developer validation, satisfy the dependency from RPMs built from the select
    record the backend identity, isolation mechanism, architecture, base
    environment, and rollback/reset point.
 
+   For a validated `aarch64` QEMU procedure, including cloud-init access,
+   overlay setup, guest verification, and source transfer, see
+   [references/qemu-aarch64.md](references/qemu-aarch64.md).
+
    Do not change the validation semantics when changing backends. The backend
    must provide command execution, source upload, a persistent batch-local RPM
    repository, DNF resolution, log/artifact retrieval, and enough environment

@@ -80,6 +80,9 @@ the same logical evidence.
 
 A QEMU workflow can use a clean base qcow2 and a per-attempt overlay:
 
+See [qemu-aarch64.md](qemu-aarch64.md) for a tested openEuler 24.03 LTS
+AArch64 procedure when a concrete runbook is useful.
+
 1. Record the base image SHA-256, QEMU arguments, machine type, CPU mode, guest
    architecture, kernel, and distribution.
 2. Boot the VM with a writable overlay and expose the attempt workspace through
