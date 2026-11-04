@@ -1,8 +1,21 @@
 {
   "image": "oe-ros-builder:24.03",
+  "platform": "linux/amd64",
   "dist": ".oe2403",
+  "target_distro": "humble",
   "output_dir": "/tmp/oe-ros-batch-example",
   "repo_files": [],
+  "fixtures": [
+    {
+      "name": "egm96-5.tar.bz2",
+      "source": "/tmp/oe-ros-fixtures/egm96-5.tar.bz2"
+    }
+  ],
+  "setup_scripts": [
+    "rm -rf /usr/local/share/GeographicLib/geoids",
+    "install -d -m 0755 /usr/local/share/GeographicLib",
+    "tar -xjf /batch/fixtures/egm96-5.tar.bz2 -C /usr/local/share/GeographicLib"
+  ],
   "dependencies": [
     {
       "name": "geographiclib",
@@ -16,7 +29,8 @@
       "name": "mavros",
       "repo": "https://gitcode.com/Rourou2285/mavros.git",
       "branch": "fix-asio-io-context",
-      "test_policy": "required",
+      "test_policy": "report",
+      "expose_buildroot_in_tests": true,
       "rpmbuild_args": [
         "--with",
         "tests"

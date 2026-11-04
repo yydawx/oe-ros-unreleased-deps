@@ -1,4 +1,4 @@
 interface:
   display_name: "openEuler ROS Unreleased Deps"
-  short_description: "Validate ROS RPMs against unpublished dependencies"
-  default_prompt: "Use $oe-ros-unreleased-deps to build a dependent ROS package against source-only dependency upgrades."
+  short_description: "Atomically validate ROS multi-repo upgrade groups"
+  default_prompt: "Use $oe-ros-unreleased-deps to discover, order, build, install, and test an openEuler ROS multi-repository upgrade group whose dependencies are not yet published."

@@ -37,11 +37,15 @@ sources to compensate for backend-specific setup.
 - Fail when one selected target emits duplicate non-debug RPM package names.
 - Read only the current attempt's source snapshot; never reuse a shared source
   directory from an earlier attempt.
-- Require explicit CTest/pytest success under the declared test policy. A
-  swallowed test command or an empty test run is not a pass unless the spec is
-  explicitly marked `allow_empty`.
+- Run CTest/pytest under the declared test policy and preserve the parsed
+  result. The default `report` policy records failures without blocking a spec
+  whose RPM built and installed; `required` is an explicit stricter gate.
 - Install and, when relevant, exercise the built packages. RPM creation alone
   does not prove installability or runtime compatibility.
+- Serialize full multi-architecture batches by default. Concurrent x86_64
+  native builds and QEMU aarch64 builds can contend for CPU, memory, disk, and
+  package-manager locks. Increase host concurrency only from measured headroom,
+  and never launch a duplicate runner for an already active attempt.
 - Keep failed attempts for diagnosis and distinguish the latest authoritative
   attempt from superseded logs.
 

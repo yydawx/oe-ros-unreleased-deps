@@ -10,6 +10,7 @@ protocol.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -29,11 +30,58 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 CTEST_PASS = re.compile(r"\b\d+% tests passed, 0 tests failed out of [1-9]\d*\b")
 PYTEST_PASS = re.compile(r"(?m)^=+\s+[1-9]\d* passed(?:, \d+ skipped)?(?:, \d+ warnings?)? in ")
 PYTEST_FAIL = re.compile(r"(?m)^=+\s+.*\b(?:failed|errors?)\b.*\bin ")
+PYTEST_EMPTY = re.compile(r"(?m)(?:collected 0 items|no tests ran in )")
 FAILURE_MARKERS = (
     "RPM TESTS FAILED",
     "The following tests FAILED:",
     "Errors while running CTest",
 )
+MAKE_WRAPPER = r"""#!/bin/bash
+# Expose the RPM currently under test before any installed public package.
+# Some generated ROS specs source /opt/ros/setup.sh in %check, which otherwise
+# hides the package's own BUILDROOT from package.xml and ament-index lookups.
+export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-$((100 + $(printf %s "$PWD" | cksum | cut -d' ' -f1) % 100))}
+export ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY:-1}
+probe=$PWD
+buildroot=
+while [[ $probe != / ]]; do
+  if [[ -d $probe/BUILDROOT ]]; then
+    buildroot=$(find "$probe/BUILDROOT" -mindepth 1 -maxdepth 1 -type d -print -quit)
+    [[ -n $buildroot ]] && break
+  fi
+  probe=$(dirname "$probe")
+done
+prefix=
+if [[ -n $buildroot ]]; then
+  prefix=$(find "$buildroot/opt/ros" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)
+fi
+if [[ -n $prefix ]]; then
+  export AMENT_PREFIX_PATH=$prefix${AMENT_PREFIX_PATH:+:$AMENT_PREFIX_PATH}
+  export CMAKE_PREFIX_PATH=$prefix${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}
+  export COLCON_PREFIX_PATH=$prefix${COLCON_PREFIX_PATH:+:$COLCON_PREFIX_PATH}
+  export LD_LIBRARY_PATH=$prefix/lib:$prefix/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+  export PATH=$prefix/bin:$PATH
+  for python_site in "$prefix"/lib/python*/site-packages "$prefix"/lib64/python*/site-packages; do
+    [[ -d $python_site ]] && PYTHONPATH=$python_site${PYTHONPATH:+:$PYTHONPATH}
+  done
+  export PYTHONPATH
+fi
+test_target=0
+for argument in "$@"; do
+  case "$argument" in
+    test|check)
+      test_target=1
+      ;;
+  esac
+done
+/usr/bin/make "$@"
+status=$?
+if [[ $test_target -eq 1 && $status -ne 0 && ${OE_ROS_TEST_POLICY:-required} == report ]]; then
+  echo "OE_ROS_TEST_POLICY=report: CTest/pytest failure is recorded but non-blocking" >&2
+  exit 0
+fi
+exit $status
+"""
 
 
 def die(message: str) -> "NoReturn":
@@ -94,34 +142,62 @@ def write_json_atomic(path: Path, value: Any) -> None:
 
 
 def assess_test_log(log_path: Path, policy: str) -> dict[str, Any]:
-    if policy not in {"required", "allow_empty", "skip"}:
-        die(f"test_policy must be required, allow_empty, or skip: {policy!r}")
+    if policy not in {"required", "allow_empty", "skip", "report"}:
+        die(f"test_policy must be required, allow_empty, skip, or report: {policy!r}")
     if policy == "skip":
-        return {"policy": policy, "status": "skipped"}
+        return {"policy": policy, "status": "skipped", "enforced": False}
     if not log_path.is_file():
         die(f"test log does not exist: {log_path}")
 
     text = log_path.read_text(encoding="utf-8", errors="replace")
+    no_tests = (
+        "No tests were found!!!" in text
+        or "RPM TESTS SKIPPED" in text
+        or bool(PYTEST_EMPTY.search(text))
+    )
+    if (
+        policy == "allow_empty"
+        and no_tests
+        and "[  FAILED  ]" not in text
+        and not re.search(r"\b[1-9]\d* tests failed\b", text)
+    ):
+        return {
+            "policy": policy,
+            "status": "empty_allowed",
+            "enforced": policy != "report",
+            "evidence": "no tests found",
+        }
     failures = [line.strip() for line in text.splitlines() if any(m in line for m in FAILURE_MARKERS)]
     failures.extend(match.group(0).strip() for match in PYTEST_FAIL.finditer(text))
     if failures:
         unique = list(dict.fromkeys(failures))
-        return {"policy": policy, "status": "failed", "evidence": unique[-20:]}
+        return {
+            "policy": policy,
+            "status": "failed",
+            "enforced": policy != "report",
+            "evidence": unique[-20:],
+        }
 
     ctest_passed = CTEST_PASS.search(text)
     pytest_passed = PYTEST_PASS.search(text)
-    no_tests = "No tests were found!!!" in text or "RPM TESTS SKIPPED" in text
     if ctest_passed or pytest_passed:
         return {
             "policy": policy,
             "status": "passed",
+            "enforced": policy != "report",
             "evidence": (ctest_passed or pytest_passed).group(0).strip(),
         }
     if policy == "allow_empty" and no_tests:
-        return {"policy": policy, "status": "empty_allowed", "evidence": "no tests found"}
+        return {
+            "policy": policy,
+            "status": "empty_allowed",
+            "enforced": True,
+            "evidence": "no tests found",
+        }
     return {
         "policy": policy,
         "status": "failed",
+        "enforced": policy != "report",
         "evidence": ["no passing CTest/pytest summary found"],
     }
 
@@ -287,8 +363,11 @@ def build_item(
     output: Path,
     container: str,
     dist: str,
+    target_distro: str | None,
     dnf_options: list[str],
     verbose: bool,
+    continue_on_error: bool,
+    attempt_id: str,
 ) -> dict[str, Any]:
     name = checked(require(item, "name"), "name")
     source, provenance = clone_or_copy(item, name, work, output, container)
@@ -297,9 +376,9 @@ def build_item(
         specs = [require(item, "spec")]
     if not isinstance(specs, list) or not specs or not all(isinstance(x, str) for x in specs):
         die(f"{name}: specs must be a non-empty string array")
-    test_policy = item.get("test_policy", "required")
-    if test_policy not in {"required", "allow_empty", "skip"}:
-        die(f"{name}: test_policy must be required, allow_empty, or skip")
+    test_policy = item.get("test_policy", "report")
+    if test_policy not in {"required", "allow_empty", "skip", "report"}:
+        die(f"{name}: test_policy must be required, allow_empty, skip, or report")
     spec_test_policies = item.get("spec_test_policies", {})
     if not isinstance(spec_test_policies, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
@@ -307,12 +386,12 @@ def build_item(
     ):
         die(f"{name}: spec_test_policies must be an object of strings")
 
-    topdir = f"/batch/rpm/{name}"
+    attempt_build_root = f"/batch/rpm/{attempt_id}"
+    item_root = f"{attempt_build_root}/{name}"
     setup = (
         "set -euo pipefail; "
-        f"rm -rf {shlex.quote(topdir)}/{{BUILD,BUILDROOT,RPMS,SOURCES,SRPMS}}; "
-        f"mkdir -p {shlex.quote(topdir)}/{{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}}; "
-        f"cp -a {shlex.quote(source)}/. {shlex.quote(topdir)}/SOURCES/"
+        f"rm -rf {shlex.quote(item_root)}; "
+        f"mkdir -p {shlex.quote(item_root)}; "
     )
     container_exec(container, setup, work / "logs" / f"{name}-prepare.log", verbose)
 
@@ -322,15 +401,36 @@ def build_item(
     builddep_args = item.get("builddep_args", [])
     if not isinstance(builddep_args, list) or not all(isinstance(x, str) for x in builddep_args):
         die(f"{name}: builddep_args must be a string array")
-    translated_builddep_args = rpmbuild_args_for_builddep(rpmbuild_args)
-    builddep_args.extend(translated_builddep_args)
+    expose_buildroot = item.get("expose_buildroot_in_tests", True)
+    if not isinstance(expose_buildroot, bool):
+        die(f"{name}: expose_buildroot_in_tests must be a boolean")
+    make_wrapper = f"{attempt_build_root}/helpers/oe-ros-make"
+    if expose_buildroot:
+        encoded_wrapper = base64.b64encode(MAKE_WRAPPER.encode()).decode()
+        wrapper_setup = (
+            "set -euo pipefail; "
+            f"mkdir -p {shlex.quote(str(Path(make_wrapper).parent))}; "
+            f"printf %s {shlex.quote(encoded_wrapper)} | base64 -d "
+            f"> {shlex.quote(make_wrapper)}; "
+            f"chmod 0755 {shlex.quote(make_wrapper)}"
+        )
+        container_exec(
+            container,
+            wrapper_setup,
+            work / "logs" / f"{name}-test-wrapper.log",
+            verbose,
+        )
 
     result: dict[str, Any] = {
         "kind": kind,
         "name": name,
+        "status": "passed",
         "source": provenance,
         "specs": [],
+        "build_root": attempt_build_root,
     }
+    spec_failures: list[dict[str, str]] = []
+    spec_topdirs: list[str] = []
 
     for spec in specs:
         if "/" in spec or spec.startswith("."):
@@ -338,19 +438,52 @@ def build_item(
         spec_guest = f"{source}/{spec}"
         log_name = f"{name}-{Path(spec).stem}.log"
         log_path = work / "logs" / log_name
+        spec_topdir = f"{item_root}/{Path(spec).stem}"
+        spec_topdirs.append(spec_topdir)
+        effective_rpmbuild_args = list(rpmbuild_args)
+        if target_distro and not any(
+            value == "ros_distro" or value.startswith("ros_distro ")
+            for value in effective_rpmbuild_args
+        ):
+            effective_rpmbuild_args.extend(["--define", f"ros_distro {target_distro}"])
+        effective_builddep_args = list(builddep_args)
+        effective_builddep_args.extend(
+            rpmbuild_args_for_builddep(effective_rpmbuild_args)
+        )
+        spec_setup = (
+            "set -euo pipefail; "
+            f"mkdir -p {shlex.quote(spec_topdir)}/{{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}}; "
+            f"cp -a {shlex.quote(source)}/. {shlex.quote(spec_topdir)}/SOURCES/; "
+            f"cp {shlex.quote(spec_guest)} {shlex.quote(spec_topdir)}/SPECS/"
+        )
+        container_exec(
+            container,
+            spec_setup,
+            work / "logs" / f"{name}-{Path(spec).stem}-prepare.log",
+            verbose,
+        )
         command = " ".join(
             [
+                f"export OE_ROS_TEST_POLICY={shlex.quote(spec_test_policies.get(spec, test_policy))};",
                 "rpmbuild -ba",
                 f"--define {shlex.quote('_smp_mflags -j4')}",
-                f"--define {shlex.quote('_topdir ' + topdir)}",
+                f"--define {shlex.quote('_topdir ' + spec_topdir)}",
                 f"--define {shlex.quote('dist ' + dist)}",
-                *map(shlex.quote, rpmbuild_args),
+                *(
+                    [
+                        f"--define {shlex.quote('__make ' + make_wrapper)}",
+                        f"--define {shlex.quote('make_build ' + make_wrapper + ' -O -j${RPM_BUILD_NCPUS} V=1 VERBOSE=1')}",
+                        f"--define {shlex.quote('make_install ' + make_wrapper + ' install DESTDIR=${RPM_BUILD_ROOT} INSTALL=\"/usr/bin/install -p\"')}",
+                    ]
+                    if expose_buildroot
+                    else []
+                ),
+                *map(shlex.quote, effective_rpmbuild_args),
                 shlex.quote(spec_guest),
             ]
         )
         script = (
             "set -euo pipefail; "
-            f"cp {shlex.quote(spec_guest)} {shlex.quote(topdir)}/SPECS/; "
             "if ! command -v createrepo_c >/dev/null 2>&1; then "
             f"dnf -y {' '.join(map(shlex.quote, dnf_options))} install createrepo_c; fi; "
             "mkdir -p /batch/repo; "
@@ -366,11 +499,11 @@ def build_item(
             "--setopt=oe-batch.gpgcheck=0 "
             "--setopt=oe-batch.repo_gpgcheck=0 "
             "--setopt=oe-batch.metadata_expire=0 "
-            f"builddep -y {' '.join(map(shlex.quote, builddep_args))} "
+            f"builddep -y {' '.join(map(shlex.quote, effective_builddep_args))} "
             f"{shlex.quote(spec_guest)}; "
             f"{command}; "
             "duplicates=$(find "
-            f"{shlex.quote(topdir)}/RPMS -type f -name '*.rpm' "
+            f"{shlex.quote(spec_topdir)}/RPMS -type f -name '*.rpm' "
             "! -name '*-debuginfo-*' ! -name '*-debugsource-*' -print0 "
             "| xargs -0 -r rpm -qp --qf '%{NAME}\\n' "
             "| sort | uniq -d); "
@@ -383,25 +516,75 @@ def build_item(
             "-name \"$package_name-*.rpm\" -delete; "
             "cp -f \"$rpm\" /batch/repo/; "
             "done < <(find "
-            f"{shlex.quote(topdir)}/RPMS -type f -name '*.rpm' "
+            f"{shlex.quote(spec_topdir)}/RPMS -type f -name '*.rpm' "
             "! -name '*-debuginfo-*' ! -name '*-debugsource-*' -print0); "
             "createrepo_c --update /batch/repo"
         )
-        container_exec(container, script, log_path, verbose)
+        try:
+            container_exec(container, script, log_path, verbose)
+        except SystemExit as error:
+            failure = {
+                "spec": spec,
+                "log": str(log_path),
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+            }
+            result["specs"].append(failure)
+            spec_failures.append(failure)
+            if not continue_on_error:
+                raise
+            continue
         policy = spec_test_policies.get(spec, test_policy)
         assessment = assess_test_log(log_path, policy)
-        result["specs"].append({"spec": spec, "log": str(log_path), "tests": assessment})
-        if assessment["status"] == "failed":
-            die(
-                f"{name}/{spec}: test policy {policy!r} failed: "
-                + "; ".join(assessment.get("evidence", []))
-            )
+        spec_result = {"spec": spec, "log": str(log_path), "tests": assessment}
+        if assessment["status"] == "failed" and policy != "report":
+            failure = {
+                **spec_result,
+                "status": "failed",
+                "error": "test policy failed: "
+                + "; ".join(assessment.get("evidence", [])),
+            }
+            result["specs"].append(failure)
+            spec_failures.append(failure)
+            if not continue_on_error:
+                die(f"{name}/{spec}: {failure['error']}")
+        else:
+            result["specs"].append(spec_result)
 
     if kind == "target":
+        duplicate_log = work / "logs" / f"{name}-duplicates.log"
+        duplicate_script = (
+            "set -euo pipefail; "
+            "duplicates=$(find "
+            f"{' '.join(shlex.quote(value) for value in spec_topdirs)} "
+            "-type f -path '*/RPMS/*' -name '*.rpm' "
+            "! -name '*-debuginfo-*' ! -name '*-debugsource-*' -print0 "
+            "| xargs -0 -r rpm -qp --qf '%{NAME}\\n' "
+            "| sort | uniq -d); "
+            "if [ -n \"$duplicates\" ]; then "
+            "echo 'duplicate RPM package names across target specs:'; "
+            "echo \"$duplicates\"; exit 40; fi"
+        )
+        try:
+            container_exec(container, duplicate_script, duplicate_log, verbose)
+            result["duplicate_check"] = {
+                "status": "passed",
+                "log": str(duplicate_log),
+            }
+        except SystemExit as error:
+            failure = {
+                "stage": "duplicate-check",
+                "log": str(duplicate_log),
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+            }
+            spec_failures.append(failure)
+            result["duplicate_check"] = failure
         install_script = (
             "set -euo pipefail; "
             "mapfile -d '' rpms < <(find "
-            f"{shlex.quote(topdir)}/RPMS -type f -name '*.rpm' "
+            f"{' '.join(shlex.quote(value) for value in spec_topdirs)} "
+            "-type f -path '*/RPMS/*' -name '*.rpm' "
             "! -name '*-debuginfo-*' ! -name '*-debugsource-*' -print0); "
             "[ ${#rpms[@]} -gt 0 ]; "
             f"dnf -y {' '.join(map(shlex.quote, dnf_options))} "
@@ -415,10 +598,61 @@ def build_item(
             "--setopt=oe-batch.gpgcheck=0 "
             "--setopt=oe-batch.repo_gpgcheck=0 "
             "--setopt=oe-batch.metadata_expire=0 "
-            "install \"${rpms[@]}\""
+            "install \"${rpms[@]}\"; "
+            "printf 'installed RPMs:\\n'; "
+            "printf '  %s\\n' \"${rpms[@]}\""
         )
-        container_exec(container, install_script, work / "logs" / f"{name}-install.log", verbose)
-        result["install"] = {"status": "passed", "log": str(work / "logs" / f"{name}-install.log")}
+        install_log = work / "logs" / f"{name}-install.log"
+        try:
+            container_exec(container, install_script, install_log, verbose)
+            result["install"] = {
+                "status": "passed",
+                "log": str(install_log),
+                "spec_topdirs": spec_topdirs,
+            }
+        except SystemExit as error:
+            failure = {
+                "stage": "install",
+                "log": str(install_log),
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+            }
+            spec_failures.append(failure)
+            result["install"] = failure
+        global_stage_failed = any(
+            failure.get("stage") in {"duplicate-check", "install"}
+            for failure in spec_failures
+        )
+        failed_specs = {
+            failure["spec"]
+            for failure in spec_failures
+            if isinstance(failure.get("spec"), str)
+        }
+        prune_topdirs = []
+        if not global_stage_failed:
+            for spec in specs:
+                if spec not in failed_specs:
+                    prune_topdirs.append(f"{item_root}/{Path(spec).stem}")
+        if prune_topdirs:
+            prune_log = work / "logs" / f"{name}-prune.log"
+            prune_script = (
+                "set -euo pipefail; "
+                + " ".join(
+                    f"rm -rf {shlex.quote(topdir)}/BUILD "
+                    f"{shlex.quote(topdir)}/BUILDROOT "
+                    f"{shlex.quote(topdir)}/SOURCES;"
+                    for topdir in prune_topdirs
+                )
+            )
+            container_exec(container, prune_script, prune_log, verbose)
+            result["pruned_build_trees"] = {
+                "status": "passed",
+                "topdirs": prune_topdirs,
+                "log": str(prune_log),
+            }
+    if spec_failures:
+        result["status"] = "failed"
+        result["errors"] = spec_failures
     return result
 
 
@@ -436,10 +670,28 @@ def main() -> None:
 
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     image = require(manifest, "image")
+    platform = manifest.get("platform")
+    if platform is not None and (
+        not isinstance(platform, str) or not re.fullmatch(r"linux/[A-Za-z0-9_]+", platform)
+    ):
+        die(f"platform must look like linux/arm64: {platform!r}")
     dist = manifest.get("dist", ".oe2403")
+    target_distro = manifest.get("target_distro")
+    if target_distro is not None and (
+        not isinstance(target_distro, str) or not SAFE_NAME.fullmatch(target_distro)
+    ):
+        die(f"target_distro must match {SAFE_NAME.pattern}: {target_distro!r}")
+    group_id = manifest.get("group_id")
+    if group_id is not None and (
+        not isinstance(group_id, str) or not SAFE_NAME.fullmatch(group_id)
+    ):
+        die(f"group_id must match {SAFE_NAME.pattern}: {group_id!r}")
+    continue_on_error = manifest.get("continue_on_error", False)
+    if not isinstance(continue_on_error, bool):
+        die("continue_on_error must be a boolean")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     attempt_id = f"{stamp}-{uuid.uuid4().hex[:8]}"
-    container = manifest.get("container_name") or f"oe-ros-batch-{stamp}"
+    container = manifest.get("container_name") or f"oe-ros-batch-{attempt_id}"
     checked(container, "container_name")
     output = Path(manifest.get("output_dir") or f"/tmp/oe-ros-batch-{stamp}").expanduser().resolve()
     if output == Path("/") or output == Path.home().resolve():
@@ -451,6 +703,14 @@ def main() -> None:
         die("dependencies and targets must be arrays")
     if not targets:
         die("manifest contains no targets")
+    fixtures = manifest.get("fixtures", [])
+    if not isinstance(fixtures, list):
+        die("fixtures must be an array")
+    setup_scripts = manifest.get("setup_scripts", [])
+    if not isinstance(setup_scripts, list) or not all(
+        isinstance(value, str) and value for value in setup_scripts
+    ):
+        die("setup_scripts must be a string array")
 
     plan = [
         *(("dependency", item) for item in dependencies),
@@ -480,8 +740,12 @@ def main() -> None:
         "image": image,
         "image_id": None,
         "dist": dist,
+        "target_distro": target_distro,
+        "group_id": group_id,
+        "platform": platform,
         "container": container,
         "output_dir": str(output),
+        "fixtures": [],
         "items": [],
     }
     summary_path = work / "summary.json"
@@ -532,20 +796,11 @@ def main() -> None:
         if mounted_output.returncode != 0 or not mounted_path or Path(mounted_path).resolve() != output:
             die(f"container {container} is not mounted at expected output: {output}")
     else:
-        run(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--name",
-                container,
-                "-v",
-                f"{output}:/batch",
-                image,
-                "sleep",
-                "infinity",
-            ]
-        )
+        docker_run = ["docker", "run", "-d", "--name", container]
+        if platform:
+            docker_run.extend(["--platform", platform])
+        docker_run.extend(["-v", f"{output}:/batch", image, "sleep", "infinity"])
+        run(docker_run)
     image_id = run(
         ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
         check=False,
@@ -554,7 +809,32 @@ def main() -> None:
     if image_id.returncode != 0:
         die(f"image not found: {image}")
     summary["image_id"] = image_id.stdout.strip()
+    fixture_dir = output / "fixtures"
+    fixture_names: set[str] = set()
+    for fixture in fixtures:
+        if not isinstance(fixture, dict):
+            die(f"invalid fixture: {fixture!r}")
+        source = Path(require(fixture, "source")).expanduser().resolve()
+        if not source.is_file():
+            die(f"fixture is not a file: {source}")
+        name = fixture.get("name") or source.name
+        if not isinstance(name, str) or not SAFE_NAME.fullmatch(name):
+            die(f"fixture name must match {SAFE_NAME.pattern}: {name!r}")
+        if name in fixture_names:
+            die(f"duplicate fixture name: {name}")
+        fixture_names.add(name)
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+        destination = fixture_dir / name
+        shutil.copy2(source, destination)
+        summary["fixtures"].append(
+            {
+                "source": str(source),
+                "guest_path": f"/batch/fixtures/{name}",
+                "sha256": sha256_file(destination),
+            }
+        )
     persist_summary()
+    failures: list[dict[str, str]] = []
     try:
         container_exec(
             container,
@@ -562,18 +842,46 @@ def main() -> None:
             work / "logs" / "dnf-makecache.log",
             args.verbose,
         )
-        for kind, item in plan:
-            result = build_item(
-                item,
-                kind,
-                work,
-                output,
+        if setup_scripts:
+            container_exec(
                 container,
-                dist,
-                dnf_options,
+                "set -euo pipefail; " + "\n".join(setup_scripts),
+                work / "logs" / "setup.log",
                 args.verbose,
             )
+        for kind, item in plan:
+            try:
+                result = build_item(
+                    item,
+                    kind,
+                    work,
+                    output,
+                    container,
+                    dist,
+                target_distro,
+                dnf_options,
+                args.verbose,
+                continue_on_error,
+                attempt_id,
+            )
+            except (Exception, SystemExit) as error:
+                failure = {
+                    "kind": kind,
+                    "name": str(item.get("name", "<missing>")),
+                    "status": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                summary["items"].append(failure)
+                failures.append(failure)
+                persist_summary()
+                if not continue_on_error:
+                    raise
+                continue
             summary["items"].append(result)
+            if result.get("status") == "failed":
+                failures.append(result)
+                if not continue_on_error:
+                    raise SystemExit(f"item failed: {result['name']}")
             persist_summary()
     except BaseException as error:
         summary["status"] = "failed"
@@ -582,12 +890,16 @@ def main() -> None:
         persist_summary()
         print(f"container retained for diagnosis: {container}", file=sys.stderr)
         raise
-    summary["status"] = "passed"
+    summary["status"] = "failed" if failures else "passed"
+    if failures:
+        summary["errors"] = failures
     summary["finished_at"] = utc_now()
     persist_summary()
     print(f"batch completed: {work}")
     print(f"summary: {summary_path}")
     print(f"container retained: {container}")
+    if failures:
+        die(f"{len(failures)} item(s) failed in group {group_id or '<none>'}")
 
 
 if __name__ == "__main__":

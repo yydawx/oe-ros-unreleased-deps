@@ -1,6 +1,6 @@
 ---
 name: oe-ros-unreleased-deps
-description: "Validate multi-package openEuler ROS upgrades whose BuildRequires need newer, unpublished source branches. Use with any suitable isolated execution backend, including containers, QEMU VMs, or dedicated hosts; not for production repository publication."
+description: "Discover, order, and atomically validate multi-repository openEuler ROS upgrade groups that depend on newer, unpublished source branches. Use with container, QEMU, or host backends; not for production publication."
 ---
 
 # openEuler ROS Unreleased Dependencies
@@ -26,14 +26,42 @@ For developer validation, satisfy the dependency from RPMs built from the select
 ## Workflow
 
 1. Identify the target repository, branch, specs, missing package names, and minimum versions.
+   Automatic discovery can use the merged/open PR window and derive each PR head,
+   head repository, base branch, changed files, Maya verdict, and source commit.
+   A local source mapping is only an optional reproducibility or dirty-tree override.
 2. Check whether each dependency has a source repo or an existing package that is only absent or stale in the public source.
 3. Create an ordered, backend-neutral batch plan. Put dependencies before consumers. Record source locators, target specs, build arguments, test policy, architecture, and expected package closure. Start from [references/example-manifest.json](references/example-manifest.json) and see [references/batch-manifest.md](references/batch-manifest.md).
+
+   For a coordinated upgrade cycle, prefer group planning over a hand-written
+   manifest:
+
+   ```bash
+   python3 scripts/joint_upgrade.py \
+     --config group-config.json \
+     --output validation-group
+   ```
+
+   This discovers the selected PR group, adds dependency-producer PRs needed by
+   failed consumers, builds the specs actually changed by each PR, and expands
+   all `_multibuild` flavors only when the PR itself changes `_multibuild`.
+   It parses internal dependencies from specs and available package manifests,
+   detects exact strongly connected cycles and conflicting source variants,
+   checks version constraints, and emits a stable topological build order.
+   Do not treat every flavor in a repository as part of the PR by default.
+   See [references/joint-groups.md](references/joint-groups.md).
 4. Choose a disposable or rollbackable execution backend. Use a container,
    QEMU/VM, remote build worker, or dedicated host according to the target
    architecture and available infrastructure. Read
    [references/execution-backends.md](references/execution-backends.md) and
    record the backend identity, isolation mechanism, architecture, base
    environment, and rollback/reset point.
+
+   Run full x86_64 and aarch64 joint batches sequentially by default. C++
+   builds, QEMU translation, package metadata, and debuginfo processing can
+   saturate the same host even though the containers appear independent. Start
+   another full batch only after measuring spare CPU, memory, disk I/O, and
+   container throughput. Do not start duplicate subagents for a batch that is
+   already running.
 
    For a validated `aarch64` QEMU procedure, including cloud-init access,
    overlay setup, guest verification, and source transfer, see
@@ -54,12 +82,32 @@ For developer validation, satisfy the dependency from RPMs built from the select
 
    Use `--dry-run` first to inspect the plan. The script creates a disposable
    build container, builds each dependency into a local RPM repository, then
-   builds and installs each target spec against that repository.
+   builds and installs every spec in each target against that repository. Each
+   spec has a separate `rpmbuild` topdir so one spec cannot erase another
+   spec's RPMs; duplicate package names are checked across the complete target
+   before installation.
 
    For a container target-only retest, keep the original container running and use
    `--reuse-container` with the same `container_name` and `output_dir`. This
    preserves the existing dependency RPM repository while replacing and
    rebuilding only the revised target.
+
+   If a full-group run is followed by targeted retests, assemble one atomic
+   architecture result from the ordered attempt summaries:
+
+   ```bash
+   python3 scripts/assemble_group_results.py \
+     --plan validation-group/group-plan.json \
+     --architecture x86_64 \
+     --output validation-group/group-summary-x86_64.json \
+     --summary /path/to/full/summary.json \
+     --summary /path/to/retest/summary.json
+   ```
+
+   Later summaries override only the `group_nodes` they cover. Missing nodes
+   remain failed; the command exits nonzero unless the complete plan is green.
+   If one spec in a large batch failed, that batch's passing sibling specs stay
+   green and only the failed node is replaced by a targeted retest.
 
    Before every later `dnf builddep` and target install, the builder upgrades
    installed packages from the batch repository.  This is required: `dnf
@@ -74,15 +122,29 @@ For developer validation, satisfy the dependency from RPMs built from the select
    a sibling spec to see its headers; a following `builddep` must resolve and
    install it.
 
-5. Report build, install, and test results separately. A non-blocking upstream test failure is not the same as a failed RPM build, and missing external test data is not a code failure. Enforce the plan's `test_policy`; by default each spec must emit a non-empty passing CTest/pytest summary.
+5. Report build, install, and test results separately. The default developer
+   gate is: every affected spec builds and every produced RPM installs. Run
+   CTest/pytest and record their parsed status under `test_policy: report`; a
+   test failure or missing external fixture is evidence, not a failed RPM
+   build. Set `required` only when tests are explicitly part of the requested
+   gate. A test-source compilation failure remains a build failure.
 6. Preserve the manifest, per-step logs, RPMs, source commit IDs, and final commands in the report.
 7. Iterate until the dependency closure is coherent. A successful `dnf builddep` can still resolve an older public package. If compilation cannot find a header, message, service, action, or Python API, compare the public package version with the selected source branch and add the matching same-batch package rather than patching the consumer around the version skew.
-8. Treat runtime entry points as part of validation. For Python/CLI packages, check at least one import or help/command surface after installation; an installable package can still be unusable against an older package from the public repository.
-9. When the request requires tests to pass, do not infer success from RPM exit status alone. Many generated specs contain `... || echo "RPM TESTS FAILED"`. Inspect the CTest/pytest summary, require zero failed tests, and distinguish a test with no discovered cases from a test that was skipped or swallowed.
-10. For tests launched with `ros2 test`, prepend the package's `%{buildroot}` prefix and its build tree/test directories to `AMENT_PREFIX_PATH`, `LD_LIBRARY_PATH`, `PATH`, and `PYTHONPATH`. Otherwise launch tests can silently use a previously installed package and fail to find the newly built executables, fixtures, or test-only libraries.
+8. Run an installation smoke check when the user requests runtime behavior or
+   when package usability is the question. Build-and-install validation does
+   not by itself prove runtime behavior.
+9. Do not infer test success from RPM exit status alone. Many generated specs
+   contain `... || echo "RPM TESTS FAILED"`. Parse the CTest/pytest summary so
+   the report distinguishes passed, failed, and no-discovered-tests outcomes,
+   even when those outcomes are non-blocking.
+10. For tests launched with `ros2 test`, prepend the package's `%{buildroot}` prefix and its build tree/test directories to `AMENT_PREFIX_PATH`, `LD_LIBRARY_PATH`, `PATH`, and `PYTHONPATH`. Otherwise launch tests can silently use a previously installed package and fail to find the newly built executables, fixtures, or test-only libraries. The reference runner's `expose_buildroot_in_tests` option overrides the standard make macros with a wrapper so generated ROS specs that source `/opt/ros/setup.sh` still test the RPM currently under construction.
 11. Every run writes an isolated attempt record plus a machine-readable summary. Record the plan hash, executor identity (image digest, VM base artifact/QEMU configuration, or host identity), source commit and dirty-tree hash, architecture, per-spec test verdict, and install result. Do not reuse an earlier attempt's logs as current evidence.
     Builds read only from that attempt's source snapshot; never fall back to a shared source tree from an earlier attempt.
 12. Reject duplicate RPM names produced by multiple specs in one target and remove stale RPMs of the same package name from the batch-local repository before adding a rebuilt artifact.
+13. Evaluate the group atomically. A group is eligible for the merge train only
+    when every impacted spec passes. Individual successful PRs do not make the
+    group green while another member or shared `_multibuild` flavor is failing.
+    The group summary is the control-plane result, not a digest of per-PR runs.
 
 ## Hard constraints
 
@@ -123,3 +185,9 @@ Report a compact matrix containing:
 |---|---|---|---|---|
 
 Include the exact missing-package names and versions. State whether the result proves only source-level buildability or also installation/runtime behavior.
+
+Before publishing a change to the planner, run:
+
+```bash
+python3 scripts/selftest_joint_upgrade.py
+```

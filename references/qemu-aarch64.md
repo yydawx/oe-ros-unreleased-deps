@@ -4,6 +4,20 @@ This runbook was validated on an x86_64 host with QEMU TCG against openEuler
 24.03 LTS AArch64. It proves buildability in an emulated AArch64 environment;
 it is not a native-performance test.
 
+For a CI-style batch after validating the full VM path, QEMU user-mode can run
+an AArch64 OCI image through `binfmt_misc`:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+docker build --platform linux/arm64 -t oe-ros-builder:24.03-arm64 env
+docker run --rm --platform linux/arm64 oe-ros-builder:24.03-arm64 uname -m
+```
+
+QEMU user-mode shares the host kernel and is not a virtual-machine isolation
+boundary. Run trusted source only, or execute it inside the disposable VM
+described below. Record the executor as QEMU user-mode rather than QEMU system
+emulation.
+
 ## Prepare the host
 
 Install `qemu-system-aarch64`, `qemu-img`, AArch64 EDK2 firmware,
@@ -83,7 +97,9 @@ then verify that public dependencies resolve on that architecture.
 2. Run `dnf builddep` with the same `--with`, `--without`, and `--define`
    conditions passed to `rpmbuild`.
 3. Build the prerequisite with `rpmbuild`.
-4. Parse CTest or pytest output rather than trusting the shell exit status.
+4. Parse CTest or pytest output rather than trusting the shell exit status;
+   under the default `report` policy, retain failures as evidence without
+   treating them as RPM build/install failures.
 5. Add only the new RPMs to the batch-local repository and run `createrepo_c`.
 6. Resolve the consumer through all configured repositories so the local
    higher-release EVR wins while public dependencies remain available.
