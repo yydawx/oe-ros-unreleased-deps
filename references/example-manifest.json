@@ -1,0 +1,32 @@
+{
+  "image": "oe-ros-builder:24.03",
+  "dist": ".oe2403",
+  "output_dir": "/tmp/oe-ros-batch-example",
+  "repo_files": [],
+  "dependencies": [
+    {
+      "name": "geographiclib",
+      "repo": "https://gitcode.com/src-openeuler/geographiclib.git",
+      "branch": "openEuler-24.03-LTS",
+      "spec": "GeographicLib.spec"
+    }
+  ],
+  "targets": [
+    {
+      "name": "mavros",
+      "repo": "https://gitcode.com/Rourou2285/mavros.git",
+      "branch": "fix-asio-io-context",
+      "test_policy": "required",
+      "rpmbuild_args": [
+        "--with",
+        "tests"
+      ],
+      "specs": [
+        "libmavconn.spec",
+        "mavros-msgs.spec",
+        "mavros.spec",
+        "mavros-extras.spec"
+      ]
+    }
+  ]
+}
