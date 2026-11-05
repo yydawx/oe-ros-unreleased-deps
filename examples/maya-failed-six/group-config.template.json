@@ -1,0 +1,109 @@
+{
+  "group_id": "maya-failed-six",
+  "cycle_start": "2026-11-01T00:00:00+08:00",
+  "target_distro": "humble",
+  "dist": ".oe2403",
+  "api": {
+    "base_url": "https://api.gitcode.com/api/v5",
+    "project_owner": "src-openeuler",
+    "author": "Rourou2285",
+    "maya_author": "wuwei_kubuds"
+  },
+  "repos": [
+    "moveit2",
+    "mavros",
+    "navigation2",
+    "off_highway_sensor_drivers",
+    "realsense-ros"
+  ],
+  "selectors": [
+    {
+      "repo": "mavros",
+      "number": 12
+    },
+    {
+      "repo": "moveit2",
+      "number": 15
+    },
+    {
+      "repo": "moveit2",
+      "number": 16
+    },
+    {
+      "repo": "navigation2",
+      "number": 37
+    },
+    {
+      "repo": "off_highway_sensor_drivers",
+      "number": 4
+    },
+    {
+      "repo": "realsense-ros",
+      "number": 6
+    }
+  ],
+  "pinned_dependencies": [
+    {
+      "name": "ament-flake8",
+      "local_path": "/path/to/ament-lint",
+      "specs": [
+        "ament-flake8.spec"
+      ],
+      "prerequisite_for_all": true,
+      "test_policy": "report"
+    },
+    {
+      "name": "launch-param-builder",
+      "local_path": "/path/to/launch_param_builder",
+      "specs": [
+        "launch-param-builder.spec"
+      ],
+      "test_policy": "report"
+    },
+    {
+      "name": "librealsense2",
+      "local_path": "/path/to/librealsense",
+      "specs": [
+        "librealsense2.spec"
+      ],
+      "test_policy": "skip"
+    },
+    {
+      "name": "nanoflann",
+      "local_path": "/path/to/nanoflann",
+      "specs": [
+        "nanoflann.spec"
+      ],
+      "test_policy": "skip"
+    },
+    {
+      "name": "ros-canopen",
+      "local_path": "/path/to/ros_canopen",
+      "specs": [
+        "can-msgs.spec"
+      ],
+      "test_policy": "skip"
+    },
+    {
+      "name": "ros2-socketcan",
+      "local_path": "/path/to/ros2_socketcan",
+      "specs": [
+        "ros2-socketcan-msgs.spec"
+      ],
+      "test_policy": "skip"
+    }
+  ],
+  "strict_head": true,
+  "maya_failed_only": true,
+  "test_policy": "report",
+  "rpmbuild_args": [
+    "--with",
+    "tests"
+  ],
+  "images": {
+    "x86_64": "oe-ros-builder:24.03",
+    "aarch64": "oe-ros-builder:24.03-arm64"
+  },
+  "output_root": "/tmp/maya-failed-six/builds"
+}
+

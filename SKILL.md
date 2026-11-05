@@ -49,6 +49,11 @@ For developer validation, satisfy the dependency from RPMs built from the select
    checks version constraints, and emits a stable topological build order.
    Do not treat every flavor in a repository as part of the PR by default.
    See [references/joint-groups.md](references/joint-groups.md).
+
+   A worked six-PR case study, including the commands, scope reduction,
+   dependency follow-ups, targeted retests, and final two-architecture result,
+   is in
+   [examples/maya-failed-six](examples/maya-failed-six/README.md).
 4. Choose a disposable or rollbackable execution backend. Use a container,
    QEMU/VM, remote build worker, or dedicated host according to the target
    architecture and available infrastructure. Read

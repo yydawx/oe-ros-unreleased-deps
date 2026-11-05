@@ -110,16 +110,18 @@ Add `--run` to execute the generated manifest. The runner also writes
 `group-summary-x86_64.json`; its `allowed_to_enter_merge_train` value is true
 only when every impacted spec for every member PR passes.
 
-## Full impact expansion
+## Conditional `_multibuild` expansion
 
-Maya and packaging tools can evaluate the entire `_multibuild` repository even
-when the visible PR diff changes only one spec. The planner therefore expands a
-repository with `_multibuild` to every flavor, not merely the changed spec.
+Select only the spec files changed by the PR. Expand a repository's
+`_multibuild` flavors only when that PR changes `_multibuild` itself. The
+manifest file controls how all flavors are built, so changing it makes all
+listed flavors part of the affected set; changing one independent spec does
+not.
 
 Different PRs in the same repository may carry different one-spec changes. The
-planner uses each changed spec's PR checkout and one common checkout for
-unchanged flavors. Shared flavor results apply to every PR whose impact set
-contains that flavor.
+planner uses each changed spec's PR checkout. When a changed `_multibuild`
+requires a common source tree for unchanged flavors, that common checkout must
+also be recorded.
 
 If two PRs propose different source variants for the same repository/spec, the
 planner reports a `source_conflicts` entry and refuses to produce a runnable
